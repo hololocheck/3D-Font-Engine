@@ -216,8 +216,8 @@ const pathData = FontEngine3D.glyphToSVGPath(json, 65); // 'A'
 │  ├─ cmap (formats 0, 4, 6, 12)
 │  ├─ kern (format 0)
 │  ├─ GPOS (pair positioning formats 1 & 2)
-│  ├─ glyf (simple + composite, **lazy on demand via parseGlyph**)
-│  └─ CFF / CFF2 (full CharString interpreter, **lazy on first .o access**)
+│  ├─ glyf (simple + composite, lazy on demand via parseGlyph)
+│  └─ CFF / CFF2 (full CharString interpreter, lazy on first .o access)
 │
 ├─ parse()                 — Main entry: buffer → typeface JSON (glyphs are lazy stubs)
 ├─ createTextShapes()      — Text → THREE.Shape[] (custom builder + WeakMap subpath cache)
@@ -443,8 +443,8 @@ const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
 │  ├─ cmap (フォーマット 0, 4, 6, 12)
 │  ├─ kern (フォーマット 0)
 │  ├─ GPOS (ペアポジショニング フォーマット 1 & 2)
-│  ├─ glyf (単純 + 複合、**parseGlyph で遅延展開**)
-│  └─ CFF / CFF2 (完全 CharString インタープリタ、**初回 .o アクセスで遅延**)
+│  ├─ glyf (単純 + 複合、parseGlyph で遅延展開)
+│  └─ CFF / CFF2 (完全 CharString インタープリタ、初回 .o アクセスで遅延)
 │
 ├─ parse()                 — メインエントリ: buffer → typeface JSON（グリフは遅延スタブ）
 ├─ createTextShapes()      — テキスト → THREE.Shape[]（カスタムビルダー＋WeakMap subpath キャッシュ）
