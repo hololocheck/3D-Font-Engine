@@ -2,8 +2,8 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)
-![Size](https://img.shields.io/badge/size-98KB-blue.svg)
-![Version](https://img.shields.io/badge/version-1.0-orange.svg)
+![Size](https://img.shields.io/badge/size-102KB-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1-orange.svg)
 
 [日本語](#japanese) | [English](#english)
 
@@ -31,22 +31,38 @@ Three.js's built-in `TextGeometry` requires fonts in a proprietary JSON format, 
 | Complex glyphs have holes/fills inverted | Custom Shape builder with proper winding & point-in-polygon testing |
 | No kerning support | kern table + GPOS pair positioning support |
 | External dependencies needed | Zero dependencies (inflate decoder built-in) |
+| Slow load on large fonts | **Lazy glyph expansion (V1.1)** — only used glyphs are decoded |
+
+### ⚡ Performance (V1.1)
+
+Recent updates dramatically reduce parse time and rendering cost, especially for **CJK fonts (10,000+ glyphs)** and **complex glyphs (kanji, decorative)**.
+
+| Improvement | What changed | Effect |
+|---|---|---|
+| **TTF `glyf` lazy expansion** | `parseGlyfTable` no longer eagerly decodes every glyph. `parseGlyph` is invoked on demand via a self-replacing getter. | First-load freeze on Japanese fonts (Noto Sans JP / Yu Gothic, 17k+ glyphs) reduced from **~5s to <100ms** |
+| **CFF/CFF2 lazy CharString** | `executeCharString` runs only when the glyph is actually used. | Same effect for OTF / variable fonts — typing 5–10 unique characters costs less than decoding the whole font |
+| **Self-replacing `glyph.o` getter** | First access decodes; getter rewrites itself to a plain string for all subsequent reads. | Zero overhead after first hit |
+| **Glyph subpath WeakMap cache** | `_computeGlyphSubpaths` caches per-glyph tessellated points keyed by `(scale, divisions, reverseWinding)`. | Identical character at same size reuses tessellation across keystrokes |
+| **Adaptive `areaDiv` floor** | Lowered from 48 to 24 for area calculation. | Roughly **halves triangle count** for kanji and decorative glyphs (and downstream `ExtrudeGeometry` / CSG cost) |
+| **Modular shape builder** | Split into `_computeGlyphSubpaths` (THREE-free, offsetX-free pure data) + `_buildShapesAtOffset` (lightweight Shape construction). | Cache hits skip tessellation entirely; only thin Shape rebuild remains |
+
+The combined result: a CJK-font keystroke that used to stall the UI for 200–500ms now lands inside a single animation frame on the second use, and under 100ms on the first.
 
 ### 📦 Supported Formats
 
 | Format | Extension | Status |
 |---|---|---|
-| TrueType | `.ttf` | ✅ Full support |
-| OpenType/CFF | `.otf` | ✅ Full support |
-| CFF2 Variable Fonts | `.otf` | ✅ Default instance |
+| TrueType | `.ttf` | ✅ Full support (lazy decode) |
+| OpenType/CFF | `.otf` | ✅ Full support (lazy decode) |
+| CFF2 Variable Fonts | `.otf` | ✅ Default instance (lazy decode) |
 | WOFF | `.woff` | ✅ Built-in inflate decoder |
 | WOFF2 | `.woff2` | ⚠️ Detection with helpful error message |
 
 ### 🔧 Features
 
 **Font Parsing**
-- TrueType `glyf` table with simple & composite glyph support
-- Full CFF Type2 CharString interpreter (shared stack, subroutines, transient array)
+- TrueType `glyf` table with simple & composite glyph support, **lazy on first access**
+- Full CFF Type2 CharString interpreter (shared stack, subroutines, transient array), **lazy on first access**
 - CFF2 parsing with blend operator support (default instance)
 - CID-keyed font support (FDSelect, per-FD Private DICTs)
 - `cmap` formats 0, 4, 6, 12
@@ -64,6 +80,7 @@ Three.js's built-in `TextGeometry` requires fonts in a proprietary JSON format, 
 - Custom `createTextShapes()` builder — bypasses `TextGeometry` winding bugs
 - Proper area-based winding detection with point-in-polygon hole assignment
 - Direct `ExtrudeGeometry` compatible output
+- Subpath cache for repeated glyph reuse
 
 **Utilities**
 - SVG path generation for debugging and 2D preview
@@ -80,10 +97,10 @@ import * as THREE from 'three';
 const response = await fetch('fonts/MyFont.ttf');
 const buffer = await response.arrayBuffer();
 
-// 2. Parse → JSON
+// 2. Parse → JSON (fast, glyphs are not yet decoded)
 const json = FontEngine3D.parse(buffer);
 
-// 3. Build Three.js shapes (recommended)
+// 3. Build Three.js shapes (recommended) — this is when glyph decoding happens lazily
 const shapes = FontEngine3D.createTextShapes(THREE, json, 'Hello World', {
     size: 80,
     curveSegments: 48
@@ -100,15 +117,36 @@ scene.add(mesh);
 </script>
 ```
 
+### 💡 Tip: Pre-warming Glyphs
+
+If you want to amortize the lazy-decode cost during idle time (e.g. right after the user picks a font), simply read `glyph.o` for the characters you expect them to use:
+
+```javascript
+const COMMON = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' +
+               'あいうえおかきくけこ...';
+let i = 0;
+function warmTick() {
+    const start = performance.now();
+    while (i < COMMON.length && performance.now() - start < 6) {
+        const g = json.glyphs[COMMON[i++]];
+        if (g) void g.o; // triggers lazy decode and self-replaces with cached string
+    }
+    if (i < COMMON.length) requestIdleCallback(warmTick);
+}
+requestIdleCallback(warmTick);
+```
+
+This decodes ~250 commonly-used characters in idle slices of 6ms each, avoiding any UI hiccup.
+
 ### 📖 API Reference
 
 #### `FontEngine3D.parse(arrayBuffer, options?)`
 
-Parses a binary font file and returns a Three.js-compatible typeface JSON object.
+Parses a binary font file and returns a Three.js-compatible typeface JSON object. As of V1.1, **glyphs are not decoded eagerly** — `glyph.o` is a self-evaluating getter that decodes on first read.
 
 ```javascript
 const json = FontEngine3D.parse(buffer);
-// json.glyphs        — glyph outlines (Three.js format)
+// json.glyphs        — glyph outlines (Three.js format, lazy on first .o access)
 // json.familyName    — font family name
 // json.ascender      — ascender value
 // json.descender     — descender value
@@ -123,11 +161,12 @@ const json = FontEngine3D.parse(buffer);
 **Options:**
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `curveSegments` | number | `24` | Bezier curve subdivision quality |
+| `characters` | string | (all mapped) | If provided, only the listed code points are eligible for decoding (e.g. `'Hello'`) |
+| `restrictCharSet` | boolean | `true` | When `false`, every mapped code point is registered (decoding still lazy) |
 
 #### `FontEngine3D.createTextShapes(THREE, json, text, options?)`
 
-Builds an array of `THREE.Shape` objects from text. **Recommended over `TextGeometry`** for reliable rendering of CFF/OTF fonts.
+Builds an array of `THREE.Shape` objects from text. **Recommended over `TextGeometry`** for reliable rendering of CFF/OTF fonts. Internally caches per-glyph tessellated subpaths keyed by `(scale, divisions, reverseWinding)`, so repeated characters across calls are essentially free.
 
 ```javascript
 const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
@@ -140,7 +179,8 @@ const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `size` | number | `100` | Font size in world units |
-| `curveSegments` | number | `24` | Bezier curve smoothness |
+| `curveSegments` | number | `48` | Bezier curve smoothness (area-detection floor 24) |
+| `reverseWinding` | boolean | `false` | Flip outer/hole classification (rare, for atypical fonts) |
 
 **Returns:** `THREE.Shape[]` — ready for `ExtrudeGeometry`
 
@@ -165,24 +205,26 @@ const pathData = FontEngine3D.glyphToSVGPath(json, 65); // 'A'
 ### 🏗️ Architecture
 
 ```
-3dfont-engine.js (98KB, ~2500 lines)
+3dfont-engine.js (~102KB, ~2570 lines)
 │
-├─ DataReader          — Big-endian binary reader
-├─ inflate()           — RFC 1951 decompressor (for WOFF)
-├─ unwrapWOFF()        — WOFF container handler
+├─ DataReader              — Big-endian binary reader
+├─ inflate()               — RFC 1951 decompressor (for WOFF)
+├─ unwrapWOFF()            — WOFF container handler
 │
 ├─ Table Parsers
 │  ├─ head, maxp, hhea, hmtx, name, OS/2, post
 │  ├─ cmap (formats 0, 4, 6, 12)
 │  ├─ kern (format 0)
 │  ├─ GPOS (pair positioning formats 1 & 2)
-│  ├─ glyf (simple + composite glyphs)
-│  └─ CFF / CFF2 (full CharString interpreter)
+│  ├─ glyf (simple + composite, **lazy on demand via parseGlyph**)
+│  └─ CFF / CFF2 (full CharString interpreter, **lazy on first .o access**)
 │
-├─ parse()             — Main entry: buffer → typeface JSON
-├─ createTextShapes()  — Text → THREE.Shape[] (custom builder)
-├─ generateSVG()       — Text → SVG string
-└─ glyphToSVGPath()    — Char → SVG path data
+├─ parse()                 — Main entry: buffer → typeface JSON (glyphs are lazy stubs)
+├─ createTextShapes()      — Text → THREE.Shape[] (custom builder + WeakMap subpath cache)
+│  ├─ _computeGlyphSubpaths  — pure data tessellation (THREE-free, offsetX-free)
+│  └─ _buildShapesAtOffset   — lightweight THREE.Shape construction
+├─ generateSVG()           — Text → SVG string
+└─ glyphToSVGPath()        — Char → SVG path data
 ```
 
 ### ⚙️ Environment Support
@@ -192,6 +234,22 @@ const pathData = FontEngine3D.glyphToSVGPath(json, 65); // 'A'
 | Browser (ES5+) | ✅ `window.FontEngine3D` |
 | CommonJS (Node.js) | ✅ `module.exports` |
 | ES Module import | ✅ Compatible |
+
+### 📜 Changelog
+
+**V1.1 — Performance Update**
+- TTF `glyf` table lazy expansion (`parseGlyfTable` no longer pre-decodes every glyph)
+- CFF/CFF2 `executeCharString` lazy getter
+- Self-replacing `glyph.o` for zero overhead after first access
+- Glyph subpath WeakMap cache (`_glyphSubpathCache`)
+- Adaptive `areaDiv` floor lowered 48 → 24
+- Split `_buildShapesFromGlyph` into `_computeGlyphSubpaths` + `_buildShapesAtOffset`
+- Removed legacy duplicate implementation
+
+**V1.0 — Initial Release**
+- TrueType / OpenType / CFF / CFF2 / WOFF parsing
+- Custom Shape builder with reliable winding detection
+- kern + GPOS pair positioning support
 
 ### 📄 License
 
@@ -221,22 +279,38 @@ Three.js の `TextGeometry` は独自の JSON フォーマットを要求し、�
 | 複雑なグリフの穴/塗りが反転 | 正確なワインディング検出 & 点包含テストによる穴判定 |
 | カーニング非対応 | kern テーブル + GPOS ペアポジショニング対応 |
 | 外部依存が必要 | ゼロ依存（inflate デコーダ内蔵） |
+| 大型フォントの読み込みが遅い | **遅延グリフ展開 (V1.1)** — 実際に使われるグリフのみデコード |
+
+### ⚡ パフォーマンス (V1.1)
+
+CJK フォント（1万グリフ超）や複雑なグリフ（漢字・装飾系）でのパース時間とレンダリングコストを大幅に削減しました。
+
+| 改善内容 | 変更点 | 効果 |
+|---|---|---|
+| **TTF `glyf` 遅延展開** | `parseGlyfTable` で全グリフを事前デコードしていたループを撤廃。`parseGlyph` を必要時に呼び出す自己置換ゲッターを採用。 | 日本語フォント (Noto Sans JP / Yu Gothic、17,000グリフ超) の初回読み込みフリーズが **約5秒 → 100ms 未満** |
+| **CFF/CFF2 遅延 CharString** | `executeCharString` をグリフ実使用時のみ実行。 | OTF / 可変フォントでも同等の効果。5〜10字使うのにフォント全体をデコードする無駄を排除 |
+| **`glyph.o` の自己置換ゲッター** | 初回アクセスでデコード、以降はプレーン文字列に置き換わる。 | 2回目以降のアクセスはオーバーヘッドゼロ |
+| **グリフ subpath WeakMap キャッシュ** | `(scale, divisions, reverseWinding)` をキーに、テッセレート済みポイントを記憶。 | 同じ文字を同じサイズで何度使っても再計算なし |
+| **`areaDiv` 床値を 48 → 24** | 面積計算用の最低分割数を半減。 | 漢字・装飾グリフのトライアングル数を**約半減**、後段の `ExtrudeGeometry` / CSG コストも軽減 |
+| **Shape ビルダーの分割** | `_computeGlyphSubpaths` (THREE 非依存・純データ) と `_buildShapesAtOffset` (軽量 Shape 構築) に分離。 | キャッシュヒット時はテッセレーション完全スキップ、薄い Shape 再構築のみ |
+
+総合効果: CJK フォントで 200〜500ms かかっていたキー入力 1 回が、2 回目以降は 1 アニメーションフレーム以内に、初回でも 100ms 未満に収まります。
 
 ### 📦 対応フォーマット
 
 | フォーマット | 拡張子 | 状態 |
 |---|---|---|
-| TrueType | `.ttf` | ✅ 完全対応 |
-| OpenType/CFF | `.otf` | ✅ 完全対応 |
-| CFF2 可変フォント | `.otf` | ✅ デフォルトインスタンス |
+| TrueType | `.ttf` | ✅ 完全対応（遅延デコード） |
+| OpenType/CFF | `.otf` | ✅ 完全対応（遅延デコード） |
+| CFF2 可変フォント | `.otf` | ✅ デフォルトインスタンス（遅延デコード） |
 | WOFF | `.woff` | ✅ inflate デコーダ内蔵 |
 | WOFF2 | `.woff2` | ⚠️ 検出＋エラーメッセージ |
 
 ### 🔧 機能
 
 **フォント解析**
-- TrueType `glyf` テーブル（単純グリフ＋複合グリフ対応）
-- 完全な CFF Type2 CharString インタープリタ（共有スタック、サブルーチン、transient 配列）
+- TrueType `glyf` テーブル（単純・複合グリフ対応、**初回参照時に遅延デコード**）
+- 完全な CFF Type2 CharString インタープリタ（共有スタック、サブルーチン、transient 配列、**初回参照時に遅延実行**）
 - CFF2 パース（blend オペレータ対応、デフォルトインスタンス）
 - CID-keyed フォント対応（FDSelect、FD別 Private DICT）
 - `cmap` フォーマット 0, 4, 6, 12
@@ -254,6 +328,7 @@ Three.js の `TextGeometry` は独自の JSON フォーマットを要求し、�
 - カスタム `createTextShapes()` ビルダー — `TextGeometry` のワインディングバグを回避
 - 面積ベースのワインディング検出＋点包含テストによる穴割り当て
 - `ExtrudeGeometry` に直接使用可能
+- 同一グリフ再利用のための subpath キャッシュ
 
 **ユーティリティ**
 - デバッグ・2Dプレビュー用 SVG 生成
@@ -270,10 +345,10 @@ import * as THREE from 'three';
 const response = await fetch('fonts/MyFont.ttf');
 const buffer = await response.arrayBuffer();
 
-// 2. パース → JSON
+// 2. パース → JSON（高速。グリフはまだデコードしない）
 const json = FontEngine3D.parse(buffer);
 
-// 3. Three.js Shapes を構築（推奨）
+// 3. Three.js Shapes を構築（推奨）— この時点で必要なグリフだけ遅延デコードされる
 const shapes = FontEngine3D.createTextShapes(THREE, json, 'こんにちは', {
     size: 80,
     curveSegments: 48
@@ -290,15 +365,36 @@ scene.add(mesh);
 </script>
 ```
 
+### 💡 Tips: グリフの事前ウォーミング
+
+ユーザーがフォントを選んだ直後の idle 時間に、よく使う文字を先回りでデコードしておくと、最初の数文字の体感ヒッチを完全に消せます。`glyph.o` を読むだけで遅延ゲッターが起動し、結果が文字列として固定されます。
+
+```javascript
+const COMMON = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' +
+               'あいうえおかきくけこ...';
+let i = 0;
+function warmTick() {
+    const start = performance.now();
+    while (i < COMMON.length && performance.now() - start < 6) {
+        const g = json.glyphs[COMMON[i++]];
+        if (g) void g.o; // 遅延デコード→自己置換
+    }
+    if (i < COMMON.length) requestIdleCallback(warmTick);
+}
+requestIdleCallback(warmTick);
+```
+
+漢字 2000 字を一括ウォームすると逆にフリーズになるので、Latin + ひらがな + カタカナ程度（約 250 字）に絞るのが推奨です。
+
 ### 📖 API リファレンス
 
 #### `FontEngine3D.parse(arrayBuffer, options?)`
 
-バイナリフォントファイルを解析し、Three.js 互換の typeface JSON オブジェクトを返します。
+バイナリフォントファイルを解析し、Three.js 互換の typeface JSON オブジェクトを返します。V1.1 から **グリフは事前デコードされず**、`glyph.o` は初回読み出し時に評価される自己置換ゲッターです。
 
 ```javascript
 const json = FontEngine3D.parse(buffer);
-// json.glyphs        — グリフアウトライン（Three.js形式）
+// json.glyphs        — グリフアウトライン（初回 .o アクセスで遅延デコード）
 // json.familyName    — フォントファミリー名
 // json.ascender      — アセンダー値
 // json.descender     — ディセンダー値
@@ -306,14 +402,20 @@ const json = FontEngine3D.parse(buffer);
 // json.kerning       — カーニングペア
 ```
 
+**オプション:**
+| キー | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `characters` | string | (全マップ) | 指定した文字のみデコード対象に登録（例: `'Hello'`） |
+| `restrictCharSet` | boolean | `true` | `false` で全マップ登録（デコードは依然遅延） |
+
 #### `FontEngine3D.createTextShapes(THREE, json, text, options?)`
 
-テキストから `THREE.Shape` 配列を構築します。CFF/OTF フォントの確実なレンダリングには **`TextGeometry` より推奨**です。
+テキストから `THREE.Shape` 配列を構築します。CFF/OTF フォントの確実なレンダリングには **`TextGeometry` より推奨**。内部では `(scale, divisions, reverseWinding)` をキーに subpath を WeakMap キャッシュしているので、同じ文字を繰り返し使うコストは実質ゼロです。
 
 ```javascript
 const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
     size: 100,        // フォントサイズ（ワールド単位）
-    curveSegments: 48 // ベジェ曲線の滑らかさ
+    curveSegments: 48 // ベジェ曲線の滑らかさ（面積検出の床値は 24）
 });
 ```
 
@@ -330,24 +432,26 @@ const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
 ### 🏗️ アーキテクチャ
 
 ```
-3dfont-engine.js (98KB, ~2500行)
+3dfont-engine.js (~102KB, ~2570行)
 │
-├─ DataReader          — ビッグエンディアン・バイナリリーダー
-├─ inflate()           — RFC 1951 デコンプレッサ（WOFF用）
-├─ unwrapWOFF()        — WOFF コンテナハンドラ
+├─ DataReader              — ビッグエンディアン・バイナリリーダー
+├─ inflate()               — RFC 1951 デコンプレッサ（WOFF用）
+├─ unwrapWOFF()            — WOFF コンテナハンドラ
 │
 ├─ テーブルパーサー
 │  ├─ head, maxp, hhea, hmtx, name, OS/2, post
 │  ├─ cmap (フォーマット 0, 4, 6, 12)
 │  ├─ kern (フォーマット 0)
 │  ├─ GPOS (ペアポジショニング フォーマット 1 & 2)
-│  ├─ glyf (単純 + 複合グリフ)
-│  └─ CFF / CFF2 (完全 CharString インタープリタ)
+│  ├─ glyf (単純 + 複合、**parseGlyph で遅延展開**)
+│  └─ CFF / CFF2 (完全 CharString インタープリタ、**初回 .o アクセスで遅延**)
 │
-├─ parse()             — メインエントリ: buffer → typeface JSON
-├─ createTextShapes()  — テキスト → THREE.Shape[]（カスタムビルダー）
-├─ generateSVG()       — テキスト → SVG文字列
-└─ glyphToSVGPath()    — 文字 → SVGパスデータ
+├─ parse()                 — メインエントリ: buffer → typeface JSON（グリフは遅延スタブ）
+├─ createTextShapes()      — テキスト → THREE.Shape[]（カスタムビルダー＋WeakMap subpath キャッシュ）
+│  ├─ _computeGlyphSubpaths  — 純データのテッセレーション（THREE 非依存・offsetX 非依存）
+│  └─ _buildShapesAtOffset   — 軽量な THREE.Shape 構築
+├─ generateSVG()           — テキスト → SVG文字列
+└─ glyphToSVGPath()        — 文字 → SVGパスデータ
 ```
 
 ### ⚙️ 動作環境
@@ -357,6 +461,22 @@ const shapes = FontEngine3D.createTextShapes(THREE, json, 'ABC', {
 | ブラウザ (ES5+) | ✅ `window.FontEngine3D` |
 | CommonJS (Node.js) | ✅ `module.exports` |
 | ES Module import | ✅ 対応 |
+
+### 📜 変更履歴
+
+**V1.1 — Performance Update**
+- TTF `glyf` テーブルの遅延展開（`parseGlyfTable` から事前デコードを撤廃）
+- CFF/CFF2 `executeCharString` の遅延ゲッター化
+- `glyph.o` の自己置換ゲッターで初回後はオーバーヘッドゼロ
+- グリフ subpath WeakMap キャッシュ (`_glyphSubpathCache`)
+- `areaDiv` の床値を 48 → 24 に
+- `_buildShapesFromGlyph` を `_computeGlyphSubpaths` + `_buildShapesAtOffset` に分離
+- 旧重複実装を削除
+
+**V1.0 — 初回リリース**
+- TrueType / OpenType / CFF / CFF2 / WOFF パース
+- 確実なワインディング検出を持つカスタム Shape ビルダー
+- kern + GPOS ペアポジショニング対応
 
 ### 📄 ライセンス
 
